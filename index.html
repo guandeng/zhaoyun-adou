@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>赵云与阿斗 · 复刻Demo</title>
+<style>
+  html,body{margin:0;height:100%;background:#1a1712;display:flex;align-items:center;justify-content:center}
+  canvas{box-shadow:0 0 40px #000;border:2px solid #5a4632;
+         width:min(96vw,calc(96vh*0.6));height:auto;touch-action:none;cursor:crosshair}
+</style>
+</head>
+<body>
+<canvas id="cv" width="480" height="800"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+ * 赵云与阿斗 —— 汉字塔防复刻 Demo（机制参照蜜獾工坊原作，素材为原创）
+ * 馒头征兵 → 文字布防 → 同名合并升级 → 凑武将名激活金色武将
+ * 击杀转移压制敌方，敌军碰到阿斗失一心，三心尽失则败
+ * ===================================================================== */
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const W = 480, H = 800, DIV = 400, LANE_X = 240;
+const KAI = 'bold %spx "Kaiti SC","STKaiti","KaiTi",serif';
+
+/* ---------------- 数值配置 ---------------- */
+const TROOPS = {                       // 兵种：静止是字，遇敌变形而战
+  '刀': { range:80,  dmg:[0,14,28,56], rate:0.85, splash:0  },
+  '枪': { range:108, dmg:[0,10,20,40], rate:0.75, splash:0  },
+  '骑': { range:82,  dmg:[0,7,14,28],  rate:0.38, splash:0  },
+  '弓': { range:158, dmg:[0,8,16,32],  rate:0.55, splash:0  },
+};
+const HEROES = {                       // 金色武将：普攻 + 定时水墨技能
+  '赵云': { range:152, dmg:[0,55,74,100], rate:0.65, splash:55,
+            skill:{ cd:8,  type:'aoe',  power:45, name:'七进七出' } },
+  '关羽': { range:100, dmg:[0,95,128,172],rate:1.10, splash:60,
+            skill:{ cd:11, type:'aoe',  power:80, name:'青龙偃月' } },
+  '黄忠': { range:172, dmg:[0,45,60,82],  rate:0.80, splash:0,
+            skill:{ cd:8,  type:'aoe',  power:55, name:'百步穿杨' } },
+  '张飞': { range:115, dmg:[0,30,40,54],  rate:0.40, splash:0,
+            skill:{ cd:10, type:'stun', power:0,  name:'当阳爆喝' } },
+};
+const HERO_PAIRS = [['赵','云','赵云'],['关','羽','关羽'],['张','飞','张飞'],['黄','忠','黄忠']];
+const FRAGS = ['赵','云','关','羽','张','飞','黄','忠'];
+const CFG = {
+  startBun:20, regen:2.5, baseCost:10, costStep:2, killReward:2,
+  fragChance:0.16, coreHP:3, mobSpeed:32, spawnGap:3.2,
+  mobHp:t=>30+t*1.1, aiTick:1.3, heroKillUp:8, maxLvl:3,
+  bossAt:75, bossGap:22, bossHpMul:4.5,
+};
+const LV_COLOR = [null,'#2a2620','#2a5aa8','#c03a2a'];
+
+/* ---------------- 音效 ---------------- */
+let AC = null, muted = false;
+function beep(f, d, type='square', v=0.04){
+  if(muted) return;
+  try{
+    AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.value = f;
+    g.gain.setValueAtTime(v, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + d);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + d);
+  }catch(e){}
+}
+
+/* ---------------- 格子 / 状态 ---------------- */
+function gridCells(side){
+  const xs = [132, 348];
+  const rows = side==='p' ? [448,520,592,664] : [352,280,208,136];
+  const cells = [];
+  rows.forEach(y=>xs.forEach(x=>
+    cells.push({ side, kind:'grid', x:x-28, y:y-28, size:56, cx:x, cy:y, content:null })));
+  return cells;
+}
+function benchCells(){                 // 兵营 5 格（原作设定）
+  return [48,94,140,186,232].map(x=>({ side:'p', kind:'bench', x:x-20, y:724, size:40, cx:x, cy:744, content:null }));
+}
+function newSide(side){
+  return { side, bun:CFG.startBun, cost:CFG.baseCost, core:CFG.coreHP,
+           cells:gridCells(side), mobs:[], spawnT:1.5, aiT:2, bossT:CFG.bossAt, flash:0 };
+}
+let S;
+function reset(){
+  S = { phase:'start', t:0, p:newSide('p'), e:newSide('e'),
+        bench:benchCells(), inks:[], floats:[],
+        fx:[], banner:null, shake:0,
+        drag:null, mouse:{x:0,y:0}, win:false };
+}
+reset();
+
+/* ---------------- 工具 ---------------- */
+const freeCell = cells => cells.filter(c=>!c.content);
+const allCells = side => side==='p' ? S.p.cells.concat(S.bench) : S.e.cells;
+function heroOf(a, b){
+  for(const [x,y,name] of HERO_PAIRS)
+    if((a===x&&b===y)||(a===y&&b===x)) return name;
+  return null;
+}
+function spawnMob(side, hp, boss){
+  (side==='p'?S.p:S.e).mobs.push({
+    side, hp, max:hp, boss:!!boss, stun:0,
+    y: side==='p' ? 416 : 384, ph:Math.random()*6.28 });
+}
+function rollPiece(){
+  if(Math.random() < CFG.fragChance)
+    return { frag: FRAGS[Math.floor(Math.random()*FRAGS.length)] };
+  const t = ['刀','枪','骑','弓'][Math.floor(Math.random()*4)];
+  return { troop:t, lvl:1, k:0 };
+}
+function inkBurst(x, y, n, spread){
+  for(let i=0;i<n;i++) S.inks.push({ x, y,
+    vx:(Math.random()-0.5)*spread, vy:(Math.random()-0.5)*spread,
+    r:2+Math.random()*4, t:0, life:0.35+Math.random()*0.3 });
+}
+const easeOut = p => 1 - Math.pow(1-p, 3);
+
+/* ---------------- 玩家操作 ---------------- */
+const BTN = { x:272, y:724, w:192, h:60 };
+function recruit(){
+  const p = S.p, free = freeCell(S.bench);
+  if(p.bun < p.cost || !free.length) return;
+  p.bun -= p.cost; p.cost += CFG.costStep;
+  free[0].content = rollPiece();
+  beep(500,0.06,'square',0.05);
+}
+function cellAt(x,y){
+  return allCells('p').find(c=>x>=c.x && x<c.x+c.size && y>=c.y && y<c.y+c.size);
+}
+function resolveDrop(from, to){
+  if(!to || to===from) return;
+  const a = from.content, b = to.content;
+  if(!b){ to.content = a; from.content = null; return; }
+  // 同名同级兵种合并升级
+  if(a.troop && b.troop && a.troop===b.troop && a.lvl===b.lvl && a.lvl<CFG.maxLvl){
+    to.content = { troop:a.troop, lvl:a.lvl+1, k:0 }; from.content = null;
+    beep(660,0.07); setTimeout(()=>beep(990,0.09),70); return;
+  }
+  // 集齐武将姓名 → 激活金色武将
+  const hero = a.frag && b.frag ? heroOf(a.frag, b.frag) : null;
+  if(hero){
+    to.content = { hero, lvl:1, k:0, skillT:3 }; from.content = null;
+    S.floats.push({ x:to.cx, y:to.cy-34, text:hero+' 参上!', t:0, color:'#b8860b', big:true });
+    inkBurst(to.cx, to.cy, 24, 220);
+    beep(523,0.1); setTimeout(()=>beep(784,0.1),100); setTimeout(()=>beep(1046,0.16),200);
+  }
+}
+
+/* ---------------- 战斗 ---------------- */
+function dealDamage(m, dmg, src){
+  m.hp -= dmg; m.lastHit = src;
+  S.floats.push({ x:LANE_X+Math.sin(m.y*0.05+m.ph)*6+(Math.random()*16-8),
+    y:m.y-16, text:'-'+dmg, t:0, color:'#c03a2a' });
+}
+function killCheck(side, foe){
+  for(const m of side.mobs){
+    if(m.hp>0 || m.reach) continue;
+    side.bun += CFG.killReward;
+    S.floats.push({ x:LANE_X, y:m.y-26, text:'+'+CFG.killReward+' 馒头', t:0, color:'#6a8a3a' });
+    inkBurst(LANE_X+Math.sin(m.y*0.05+m.ph)*6, m.y, 8, 120);
+    // 武将杀敌升级
+    const src = m.lastHit;
+    if(src && src.content && src.content.hero){
+      const h = src.content;
+      if(++h.k >= CFG.heroKillUp && h.lvl < CFG.maxLvl){
+        h.k = 0; h.lvl++;
+        S.floats.push({ x:src.cx, y:src.cy-36, text:h.hero+' 升至'+h.lvl+'级!', t:0, color:'#b8860b', big:true });
+        beep(880,0.1); setTimeout(()=>beep(1174,0.14),100);
+      }
+    }
+    // 击杀转移：敌军转投对方战阵
+    if(foe.mobs.length<30) spawnMob(foe.side, CFG.mobHp(S.t), false);
+  }
+  side.mobs = side.mobs.filter(m=>m.hp>0);
+}
+/* ---------- 武将技能：伤害结算 + 专属特效 ---------- */
+function heroSkill(side, c, h){
+  const H = HEROES[h.hero], sk = H.skill;
+  const dir = side.side==='p' ? 1 : -1;
+  const targets = side.mobs.filter(m=>m.hp>0);
+  for(const m of targets){
+    if(sk.type==='aoe') dealDamage(m, sk.power*h.lvl, c);
+    else {
+      m.stun = 2; m.y -= dir*60;              // 当阳爆喝：击退+眩晕
+      S.floats.push({ x:LANE_X+Math.sin(m.y*0.05+m.ph)*6, y:m.y-18,
+                      text:'眩晕', t:0, color:'#8a2418' });
+    }
+  }
+  skillFx(side, c, targets);
+  c.skillFlash = 0.5;
+  S.banner = { text:sk.name, hero:h.hero, t:0, life:1.15 };
+  // 每名武将独立音色
+  if(h.hero==='张飞') beep(88,0.45,'sawtooth',0.09);
+  else if(h.hero==='关羽'){
+    beep(147,0.28,'sawtooth',0.08);
+    setTimeout(()=>beep(392,0.26,'sawtooth',0.06),110);
+  } else if(h.hero==='黄忠'){
+    for(let i=0;i<4;i++) setTimeout(()=>beep(1250+i*180,0.04,'square',0.03), i*55);
+  } else {
+    setTimeout(()=>beep(1400,0.05,'square',0.04),0);
+    setTimeout(()=>beep(1800,0.05,'square',0.035),55);
+    setTimeout(()=>beep(2300,0.08,'square',0.03),115);
+  }
+}
+function skillFx(side, c, targets){
+  const dir = side.side==='p' ? 1 : -1;
+  const pts = targets.map(m=>({ x:LANE_X+Math.sin(m.y*0.05+m.ph)*6, y:m.y }));
+  const hero = c.content.hero;
+  if(hero === '赵云'){                        // 七进七出：七道银枪连刺
+    const strokes = [];
+    for(let i=0;i<7;i++){
+      const t = pts[i % Math.max(1, pts.length)];
+      strokes.push({ x1:c.cx, y1:c.cy,
+        x2:LANE_X + (i%2 ? 12 : -12),
+        y2:t ? t.y : c.cy + dir*(50+i*24),
+        delay:i*0.05, dur:0.24 });
+    }
+    S.fx.push({ type:'slash', t:0, life:1.05, strokes });
+    S.shake = Math.max(S.shake, 3);
+  } else if(hero === '关羽'){                 // 青龙偃月：巨大弧月刀光
+    S.fx.push({ type:'crescent', t:0, life:0.82, x:c.cx, y:c.cy, dir,
+                maxR:Math.max(196, HEROES['关羽'].range*1.5) });
+    S.shake = Math.max(S.shake, 6);
+  } else if(hero === '黄忠'){                 // 百步穿杨：全屏箭雨
+    const shots = pts.map((p,i)=>({ x:p.x, y:p.y, delay:i*0.015 }));
+    for(let i=0;i<10;i++)
+      shots.push({ x:LANE_X+(Math.random()*130-65),
+        y: side.side==='p' ? DIV+30+Math.random()*270 : 30+Math.random()*270,
+        delay:0.04+Math.random()*0.18, ghost:true });
+    S.fx.push({ type:'arrows', t:0, life:0.78, x:c.cx, y:c.cy, shots });
+    S.shake = Math.max(S.shake, 2);
+  } else {                                    // 当阳爆喝：声波震荡
+    S.fx.push({ type:'shock', t:0, life:0.95, x:c.cx, y:c.cy, word:'喝' });
+    S.shake = Math.max(S.shake, 9);
+  }
+}
+function updateSide(side, dt, foe){
+  side.bun += CFG.regen*dt;
+  side.flash = Math.max(0, side.flash - dt);
+  // 敌军来袭 + Boss「操」
+  side.spawnT -= dt;
+  if(side.spawnT<=0 && side.mobs.length<30){
+    side.spawnT = CFG.spawnGap*(0.85+Math.random()*0.3);
+    spawnMob(side.side, CFG.mobHp(S.t), false);
+  }
+  if(S.t > CFG.bossAt){
+    side.bossT -= dt;
+    if(side.bossT<=0){ side.bossT = CFG.bossGap; spawnMob(side.side, CFG.mobHp(S.t)*CFG.bossHpMul, true); }
+  }
+  // 敌军推进（眩晕时止步）
+  const targetY = side.side==='p' ? 692 : 108;
+  const dir = side.side==='p' ? 1 : -1;
+  for(const m of side.mobs){
+    if(m.stun>0) m.stun -= dt;
+    else m.y += dir*CFG.mobSpeed*(m.boss?0.6:1)*dt;
+    if(dir>0 ? m.y>=targetY : m.y<=targetY){
+      m.hp = 0; m.reach = true;
+      side.core--; side.flash = 0.5;
+      inkBurst(LANE_X, targetY, 16, 260);
+      beep(120,0.25,'sawtooth',0.08);
+    }
+  }
+  // 文字兵种遇敌变形而战
+  for(const c of side.cells){
+    const u = c.content;
+    if(!u || (!u.troop && !u.hero)) continue;
+    const T = u.troop ? TROOPS[u.troop] : HEROES[u.hero];
+    c.anim = Math.max(0, (c.anim||0) - dt);
+    c.skillFlash = Math.max(0, (c.skillFlash||0) - dt);
+    // 武将水墨技能
+    if(u.hero){
+      c.skillT -= dt;
+      if(c.skillT<=0 && side.mobs.some(m=>m.hp>0)){ c.skillT = T.skill.cd; heroSkill(side, c, u); }
+    }
+    c.cd = (c.cd||0) - dt;
+    if(c.cd > 0) continue;
+    let best=null, bd=1e9;
+    for(const m of side.mobs){
+      if(m.hp<=0) continue;
+      const mx = LANE_X + Math.sin(m.y*0.05+m.ph)*6;
+      const d = Math.hypot(mx-c.cx, m.y-c.cy);
+      if(d<=T.range && d<bd){ bd=d; best=m; }
+    }
+    if(!best) continue;
+    c.cd = T.rate; c.anim = 0.18;               // 字体变形瞬间
+    dealDamage(best, T.dmg[u.lvl], c);
+    if(T.splash) for(const m of side.mobs){
+      if(m===best || m.hp<=0) continue;
+      const mx = LANE_X + Math.sin(m.y*0.05+m.ph)*6;
+      const bx = LANE_X + Math.sin(best.y*0.05+best.ph)*6;
+      if(Math.hypot(mx-bx, m.y-best.y) <= T.splash) dealDamage(m, T.dmg[u.lvl], c);
+    }
+    inkBurst(LANE_X+Math.sin(best.y*0.05+best.ph)*6, best.y, 3, 90);
+    if(side.side==='p' && Math.random()<0.3) beep(700+Math.random()*200,0.03,'square',0.015);
+  }
+  killCheck(side, foe);
+}
+
+/* ---------------- AI（规则与玩家相同） ---------------- */
+function aiTick(){
+  const e = S.e, free = freeCell(e.cells);
+  const frags = e.cells.filter(c=>c.content && c.content.frag);
+  for(const ca of frags) for(const cb of frags){
+    const hero = ca!==cb && heroOf(ca.content.frag, cb.content.frag);
+    if(hero){ cb.content = { hero, lvl:1, k:0, skillT:3 }; ca.content = null; return; }
+  }
+  if(e.bun>=e.cost && free.length){
+    e.bun -= e.cost; e.cost += CFG.costStep;
+    free[Math.floor(Math.random()*free.length)].content = rollPiece();
+    return;
+  }
+  if(Math.random()<0.45){
+    for(let i=0;i<e.cells.length;i++) for(let j=i+1;j<e.cells.length;j++){
+      const a=e.cells[i].content, b=e.cells[j].content;
+      if(a&&b&&a.troop&&a.troop===b.troop&&a.lvl===b.lvl&&a.lvl<CFG.maxLvl){
+        e.cells[j].content = { troop:a.troop, lvl:a.lvl+1, k:0 };
+        e.cells[i].content = null; return;
+      }
+    }
+  }
+}
+
+/* ---------------- 主更新 ---------------- */
+/* ---------------- 特效推进（暂停时也继续播放，避免定格） ---------------- */
+function updateEffects(dt){
+  for(const p of S.inks){ p.t+=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+  S.inks = S.inks.filter(p=>p.t<p.life);
+  for(const f of S.fx) f.t += dt;
+  S.fx = S.fx.filter(f=>f.t<f.life);
+  if(S.banner){ S.banner.t += dt; if(S.banner.t >= S.banner.life) S.banner = null; }
+  for(const f of S.floats){ f.t+=dt; f.y-=24*dt; }
+  S.floats = S.floats.filter(f=>f.t<(f.big?1.4:0.7));
+  if(S.shake>0){ S.shake *= Math.max(0, 1-dt*7); if(S.shake<0.15) S.shake = 0; }
+}
+function update(dt){
+  if(S.phase!=='play'){ updateEffects(dt); return; }
+  S.t += dt;
+  updateSide(S.p, dt, S.e);
+  updateSide(S.e, dt, S.p);
+  S.e.aiT -= dt;
+  if(S.e.aiT<=0){ S.e.aiT = CFG.aiTick; aiTick(); }
+  if(S.p.core<=0 || S.e.core<=0){
+    S.phase='over'; S.win = S.e.core<=0;
+    if(S.win){ beep(523,.12); setTimeout(()=>beep(659,.12),120); setTimeout(()=>beep(784,.2),240); }
+    else beep(140,.5,'sawtooth',0.08);
+  }
+  updateEffects(dt);
+}
+
+/* ---------------- 绘制 ---------------- */
+function text(str, x, y, size=14, color='#2a2620', align='left'){
+  ctx.fillStyle = color; ctx.font = KAI.replace('%s', size);
+  ctx.textAlign = align; ctx.fillText(str, x, y);
+}
+function block(x, y, s, fill, border){
+  ctx.fillStyle = 'rgba(0,0,0,.18)'; ctx.fillRect(x+3, y+4, s, s);
+  ctx.fillStyle = fill;   ctx.fillRect(x, y, s, s);
+  ctx.strokeStyle = border; ctx.lineWidth = 2; ctx.strokeRect(x+1, y+1, s-2, s-2);
+}
+function heart(x, y, s, on){
+  const rows = [".RR.RR.","RRRRRRR","RRRRRRR",".RRRRR.","..RRR..","...R..."];
+  ctx.fillStyle = on ? '#e53b3b' : '#c8bfae';
+  rows.forEach((r,dy)=>[...r].forEach((ch,dx)=>{ if(ch==='R') ctx.fillRect(x+dx*s, y+dy*s, s, s); }));
+}
+function drawCell(c, hover){
+  ctx.fillStyle = 'rgba(90,70,50,.10)';
+  ctx.fillRect(c.x, c.y, c.size, c.size);
+  ctx.strokeStyle = hover ? '#c03a2a' : 'rgba(90,70,50,.45)';
+  ctx.lineWidth = hover ? 2 : 1;
+  ctx.setLineDash(hover ? [] : [4,4]);
+  ctx.strokeRect(c.x+1, c.y+1, c.size-2, c.size-2);
+  ctx.setLineDash([]);
+}
+function drawContent(c){
+  const ct = c.content; if(!ct) return;
+  const s = c.size-8, x = c.x+4, y = c.y+4;
+  if(ct.frag){                                  // 未配对的字：睡大觉，无增益
+    block(x, y, s, '#efe8d5', '#b0a68c');
+    text(ct.frag, c.cx, c.cy+s*0.32, s*0.55, '#9a927f', 'center');
+    text('z', c.cx+s*0.34, c.cy-s*0.22, s*0.24, '#b0a68c', 'center');
+    return;
+  }
+  if(ct.troop){                                 // 兵种字：平时静止，遇敌变形
+    const fighting = c.anim > 0;
+    const scale = fighting ? 1.22 : 1;
+    block(x, y, s, fighting ? '#f6e3c8' : '#f7f0dd', fighting ? '#c03a2a' : '#8a7a5a');
+    text(ct.troop, c.cx, c.cy+s*0.34*scale, s*0.62*scale,
+         fighting ? '#c03a2a' : LV_COLOR[ct.lvl], 'center');
+    for(let i=0;i<ct.lvl;i++){                  // 等级墨点
+      ctx.fillStyle = LV_COLOR[ct.lvl];
+      ctx.beginPath(); ctx.arc(c.cx-(ct.lvl*8)/2+i*8+4, c.y+c.size-8, 3, 0, 6.29); ctx.fill();
+    }
+    return;
+  }
+  if(ct.hero){                                  // 金色武将
+    const fighting = c.anim > 0;
+    // 释放技能瞬间：金色爆发光环
+    if(c.skillFlash > 0){
+      const k = c.skillFlash / 0.5, R = c.size*0.55 + (1-k)*34;
+      ctx.globalAlpha = k*0.55; ctx.fillStyle = '#ffe89a';
+      ctx.beginPath(); ctx.arc(c.cx, c.cy, R, 0, 6.29); ctx.fill();
+      ctx.globalAlpha = k*0.9; ctx.strokeStyle = '#ffd94d'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(c.cx, c.cy, R, 0, 6.29); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    block(x, y, s, fighting ? '#f2d689' : '#f8e6b0', '#b8860b');
+    ctx.strokeStyle = '#b8860b'; ctx.lineWidth = 1;
+    ctx.strokeRect(x+4, y+4, s-8, s-8);
+    const ch = ct.hero, sc = fighting ? 1.15 : 1;
+    text(ch[0], c.cx, c.cy-s*0.02, s*0.4*sc, '#8a6a10', 'center');
+    text(ch[1], c.cx, c.cy+s*0.38*sc, s*0.4*sc, '#8a6a10', 'center');
+    for(let i=0;i<ct.lvl;i++){
+      ctx.fillStyle = '#b8860b';
+      ctx.beginPath(); ctx.arc(c.cx-(ct.lvl*8)/2+i*8+4, c.y+c.size-8, 3, 0, 6.29); ctx.fill();
+    }
+    // 技能冷却环：蓄满后金色呼吸（拖拽预览不画）
+    if(c.kind){
+      const cdMax = HEROES[ct.hero].skill.cd;
+      const ratio = 1 - Math.max(0, c.skillT || 0) / cdMax;
+      const rr = c.size/2 - 1;
+      ctx.lineWidth = 2; ctx.setLineDash([]);
+      ctx.strokeStyle = 'rgba(184,134,11,.22)';
+      ctx.beginPath(); ctx.arc(c.cx, c.cy, rr, 0, 6.29); ctx.stroke();
+      if(ratio >= 1){
+        ctx.globalAlpha = 0.45 + 0.45*Math.sin(S.t*7);
+        ctx.strokeStyle = '#ffd94d'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(c.cx, c.cy, rr, 0, 6.29); ctx.stroke();
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.strokeStyle = '#b8860b';
+        ctx.beginPath();
+        ctx.arc(c.cx, c.cy, rr, -Math.PI/2, -Math.PI/2 + ratio*6.283);
+        ctx.stroke();
+      }
+    }
+  }
+}
+function drawAdou(coreY, heartY, side, label){
+  const s = 56, x = LANE_X-s/2, y = coreY-s/2;
+  if(side.flash>0){ ctx.fillStyle='rgba(192,58,42,.15)';
+    ctx.fillRect(0, side.side==='p'?DIV:0, W, DIV); }
+  block(x, y, s, '#cfe0f4', '#2a4a8a');
+  text('斗', LANE_X, coreY+s*0.3, s*0.66, '#2a4a8a', 'center');
+  for(let i=0;i<CFG.coreHP;i++) heart(LANE_X-30+i*22, heartY, 3, i<side.core);
+  text(label, LANE_X, side.side==='p' ? coreY+s/2+18 : coreY+s/2+16, 11, '#8a7a5a', 'center');
+}
+function drawMob(m){
+  const mx = LANE_X + Math.sin(m.y*0.05+m.ph)*6;
+  const s = m.boss ? 46 : 30;
+  const bob = Math.abs(Math.sin(S.t*8+m.ph))*2;
+  if(m.stun>0){ ctx.globalAlpha = 0.5; }
+  block(mx-s/2, m.y-s/2+bob, s, '#f0e0d0', '#b02828');
+  text(m.boss?'操':'寇', mx, m.y+s*0.3+bob, s*0.6, '#b02828', 'center');
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#d8c9b0'; ctx.fillRect(mx-15, m.y-s/2-7, 30, 3);
+  ctx.fillStyle = '#b02828'; ctx.fillRect(mx-15, m.y-s/2-7, 30*Math.max(0,m.hp/m.max), 3);
+}
+/* ---------- 技能特效绘制 ---------- */
+function drawFx(){
+  for(const f of S.fx){
+    if(f.type==='slash') drawSlash(f);
+    else if(f.type==='crescent') drawCrescent(f);
+    else if(f.type==='arrows') drawArrows(f);
+    else if(f.type==='shock') drawShock(f);
+  }
+}
+function drawSlash(f){                       // 赵云·七进七出：锥形枪影
+  ctx.save();
+  ctx.lineCap = 'round';
+  for(const s of f.strokes){
+    const p = (f.t - s.delay) / s.dur;
+    if(p <= 0) continue;
+    const grow = easeOut(Math.min(1, p));
+    const fade = Math.max(0, 1 - Math.max(0, p-0.55)/0.45);
+    const tx = s.x1 + (s.x2-s.x1)*grow, ty = s.y1 + (s.y2-s.y1)*grow;
+    ctx.globalAlpha = fade*0.20; ctx.strokeStyle = '#7fc9ff'; ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(tx,ty); ctx.stroke();
+    ctx.globalAlpha = fade*0.62; ctx.strokeStyle = '#bfe9ff'; ctx.lineWidth = 4.5;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(tx,ty); ctx.stroke();
+    ctx.globalAlpha = fade*0.95; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(tx,ty); ctx.stroke();
+    if(p < 1.4){                             // 枪尖寒光
+      ctx.globalAlpha = fade*0.9; ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(tx, ty, 3.6*(1-grow*0.35), 0, 6.29); ctx.fill();
+      ctx.globalAlpha = fade*0.35; ctx.fillStyle = '#bfe9ff';
+      ctx.beginPath(); ctx.arc(tx, ty, 9*(1-grow*0.3), 0, 6.29); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawCrescent(f){                    // 关羽·青龙偃月：弧月刀光
+  const p = Math.min(1, f.t/f.life);
+  const e = easeOut(p);
+  const fade = p < 0.65 ? 1 : Math.max(0, 1-(p-0.65)/0.35);
+  const R = 26 + (f.maxR-26)*e;
+  const base = f.dir > 0 ? -Math.PI/2 : Math.PI/2;
+  const half = Math.PI*0.78, rot = (p-0.5)*0.7;
+  const a0 = base - half + rot, a1 = base + half + rot;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.globalAlpha = fade*0.22; ctx.strokeStyle = '#2f8f4e'; ctx.lineWidth = 30*(1-p*0.55);
+  ctx.beginPath(); ctx.arc(f.x,f.y,R,a0,a1); ctx.stroke();
+  const g = ctx.createLinearGradient(f.x-R, f.y-R, f.x+R, f.y+R);
+  g.addColorStop(0,'#2f8f4e'); g.addColorStop(0.5,'#9fe8b8'); g.addColorStop(1,'#d4af37');
+  ctx.globalAlpha = fade*0.95; ctx.strokeStyle = g; ctx.lineWidth = 13*(1-p*0.6);
+  ctx.beginPath(); ctx.arc(f.x,f.y,R,a0,a1); ctx.stroke();
+  ctx.globalAlpha = fade; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3*(1-p*0.5);
+  ctx.beginPath(); ctx.arc(f.x,f.y,R, a0+half*0.25, a1-half*0.25); ctx.stroke();
+  ctx.globalAlpha = fade*0.55; ctx.strokeStyle = '#d4af37'; ctx.lineWidth = 2;
+  for(let i=0;i<5;i++){                      // 刀气飞散
+    const a = a0 + (a1-a0)*(i/4), ext = 20*(1-p);
+    ctx.beginPath();
+    ctx.moveTo(f.x+Math.cos(a)*R, f.y+Math.sin(a)*R);
+    ctx.lineTo(f.x+Math.cos(a)*(R+ext), f.y+Math.sin(a)*(R+ext));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawArrows(f){                      // 黄忠·百步穿杨：箭雨
+  ctx.save();
+  ctx.lineCap = 'round';
+  for(const s of f.shots){
+    const p = (f.t - s.delay) / 0.16;
+    if(p <= 0) continue;
+    const e = Math.min(1, p);
+    const hx = f.x + (s.x-f.x)*e, hy = f.y + (s.y-f.y)*e;
+    const tx = f.x + (s.x-f.x)*Math.max(0, e-0.4);
+    const ty = f.y + (s.y-f.y)*Math.max(0, e-0.4);
+    const fade = p > 1 ? Math.max(0, 1-(p-1)/0.8) : 1;
+    const w = s.ghost ? 1 : 2;
+    ctx.globalAlpha = fade*(s.ghost?0.28:0.5);
+    ctx.strokeStyle = '#8a6a10'; ctx.lineWidth = w+4;
+    ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(hx,hy); ctx.stroke();
+    ctx.globalAlpha = fade*(s.ghost?0.45:0.95);
+    ctx.strokeStyle = s.ghost ? '#c9a227' : '#f8e6b0'; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(hx,hy); ctx.stroke();
+    if(e < 1){                               // 箭头
+      const ang = Math.atan2(s.y-f.y, s.x-f.x), sz = s.ghost?3.4:5;
+      ctx.globalAlpha = fade*0.9; ctx.fillStyle = '#f8e6b0';
+      ctx.beginPath(); ctx.moveTo(hx,hy);
+      ctx.lineTo(hx-Math.cos(ang-0.5)*sz*1.7, hy-Math.sin(ang-0.5)*sz*1.7);
+      ctx.lineTo(hx-Math.cos(ang+0.5)*sz*1.7, hy-Math.sin(ang+0.5)*sz*1.7);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawShock(f){                        // 张飞·当阳爆喝：声波震荡
+  ctx.save();
+  for(let i=0;i<3;i++){
+    const lp = (f.t - i*0.11) / 0.72;
+    if(lp <= 0 || lp >= 1) continue;
+    const R = 18 + lp*150;
+    ctx.globalAlpha = (1-lp)*0.85; ctx.strokeStyle = '#c03a2a';
+    ctx.lineWidth = 6*(1-lp)+1;
+    ctx.beginPath(); ctx.arc(f.x,f.y,R,0,6.29); ctx.stroke();
+    ctx.globalAlpha = (1-lp)*0.35; ctx.strokeStyle = '#8a2418'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(f.x,f.y,R*0.82,0,6.29); ctx.stroke();
+  }
+  const q = Math.min(1, f.t/0.3);
+  const sz = 34 + easeOut(q)*86;
+  const fade = f.t < 0.4 ? 1 : Math.max(0, 1-(f.t-0.4)/0.5);
+  ctx.globalAlpha = fade*0.95;
+  ctx.font = KAI.replace('%s', sz);
+  ctx.textAlign = 'center';
+  ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,232,214,.85)';
+  ctx.strokeText(f.word, f.x, f.y + sz*0.32);
+  ctx.fillStyle = '#c03a2a';
+  ctx.fillText(f.word, f.x, f.y + sz*0.32);
+  ctx.restore();
+}
+function drawBanner(b){                      // 技能名水墨横幅
+  const fade = b.t < 0.18 ? b.t/0.18
+             : b.t > 0.82 ? Math.max(0, 1-(b.t-0.82)/0.33) : 1;
+  const sc = 0.86 + 0.14*easeOut(Math.min(1, b.t/0.25));
+  const blobs = [[0,0,1],[-56,-7,.62],[50,8,.68],[-26,11,.42],[30,-12,.5]];
+  ctx.save();
+  ctx.translate(W/2, DIV); ctx.scale(sc, sc);
+  for(const [bx,by,br] of blobs){
+    ctx.globalAlpha = fade*0.11; ctx.fillStyle = '#14110c';
+    ctx.beginPath(); ctx.ellipse(bx,by, 92*br, 23*br, 0, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = fade;
+  ctx.font = KAI.replace('%s', 40); ctx.textAlign = 'center';
+  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(248,230,176,.32)';
+  ctx.strokeText(b.text, 0, 14);
+  ctx.fillStyle = '#f8e6b0'; ctx.fillText(b.text, 0, 14);
+  ctx.font = KAI.replace('%s', 12);
+  ctx.fillStyle = 'rgba(232,200,152,.85)';
+  ctx.fillText('「' + b.hero + '」', 0, 40);
+  ctx.restore();
+}
+function render(){
+  // 震屏：世界层整体偏移，背景多画一圈避免露边
+  ctx.save();
+  if(S.shake > 0)
+    ctx.translate((Math.random()-0.5)*S.shake, (Math.random()-0.5)*S.shake);
+  // 宣纸底 + 楚河汉界
+  ctx.fillStyle = '#e3d8c0'; ctx.fillRect(-16,-16,W+32,DIV+16);
+  ctx.fillStyle = '#efe6d0'; ctx.fillRect(-16,DIV,W+32,H-DIV+32);
+  ctx.fillStyle = '#d9ceae'; ctx.fillRect(-16, DIV-14, W+32, 28);
+  ctx.fillStyle = '#8a7a5a'; ctx.fillRect(-16, DIV-1, W+32, 2);
+  text('楚 河        汉 界', W/2, DIV+5, 13, '#8a7a5a', 'center');
+  // 进攻路线
+  ctx.fillStyle = 'rgba(90,70,50,.10)'; ctx.fillRect(LANE_X-20, 0, 40, DIV);
+  ctx.fillRect(LANE_X-20, DIV, 40, H-DIV);
+  ctx.strokeStyle = 'rgba(90,70,50,.3)'; ctx.setLineDash([6,10]);
+  ctx.beginPath(); ctx.moveTo(LANE_X,0); ctx.lineTo(LANE_X,H); ctx.stroke();
+  ctx.setLineDash([]);
+  // 格子 / 阿斗 / 敌军 / 文字兵种
+  const hover = S.drag ? cellAt(S.mouse.x, S.mouse.y) : null;
+  S.e.cells.forEach(c=>drawCell(c,false));
+  S.p.cells.forEach(c=>drawCell(c, hover===c));
+  S.bench.forEach(c=>drawCell(c, hover===c));
+  drawAdou(84, 24, S.e, '敌方阿斗');
+  drawAdou(716, 658, S.p, '我方阿斗');
+  for(const side of [S.p, S.e]) for(const m of side.mobs) drawMob(m);
+  S.e.cells.forEach(drawContent);
+  S.p.cells.forEach(drawContent);
+  S.bench.forEach(drawContent);
+  // 墨汁 / 飘字
+  for(const p of S.inks){ ctx.globalAlpha = (1-p.t/p.life)*0.8;
+    ctx.fillStyle = '#2a2620';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  for(const f of S.floats){ ctx.globalAlpha = 1-f.t/(f.big?1.4:0.7);
+    text(f.text, f.x, f.y, f.big?18:11, f.color, 'center'); }
+  ctx.globalAlpha = 1;
+  // 武将技能特效 + 技能名横幅
+  drawFx();
+  if(S.banner) drawBanner(S.banner);
+  ctx.restore();                    // 结束震屏偏移
+  // HUD
+  text('馒头 '+Math.floor(S.p.bun), 16, 424, 15, '#8a5a10');
+  const mm = String(Math.floor(S.t/60)).padStart(2,'0'),
+        ss = String(Math.floor(S.t%60)).padStart(2,'0');
+  text(mm+':'+ss, 464, 424, 13, '#8a7a5a', 'right');
+  text('兵营', 28, 716, 11, '#8a7a5a');
+  // 红色征召按钮
+  const can = S.p.bun>=S.p.cost && freeCell(S.bench).length && S.phase==='play';
+  ctx.fillStyle = can ? '#c03a2a' : '#a89484';
+  ctx.fillRect(BTN.x, BTN.y, BTN.w, BTN.h);
+  ctx.strokeStyle = can ? '#e8c898' : '#c8bfae'; ctx.lineWidth = 2;
+  ctx.strokeRect(BTN.x+2, BTN.y+2, BTN.w-4, BTN.h-4);
+  text('征 召 士 兵', BTN.x+BTN.w/2, BTN.y+26, 17, can?'#f8ecd0':'#e0d8c8', 'center');
+  text('馒头 × '+S.p.cost, BTN.x+BTN.w/2, BTN.y+47, 13, can?'#f0d0a0':'#d0c8b8', 'center');
+  // 拖拽幽灵 + 射程圈
+  if(S.drag){
+    const d = S.drag, m = S.mouse;
+    const T = d.content.troop ? TROOPS[d.content.troop] : d.content.hero ? HEROES[d.content.hero] : null;
+    if(T){ ctx.strokeStyle = 'rgba(42,38,32,.25)'; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(m.x, m.y, T.range, 0, 6.29); ctx.stroke(); ctx.setLineDash([]); }
+    ctx.globalAlpha = 0.8;
+    drawContent({ content:d.content, cx:m.x, cy:m.y, x:m.x-28, y:m.y-28, size:56 });
+    ctx.globalAlpha = 1;
+  }
+  // 覆盖层
+  if(S.phase!=='play'){
+    ctx.fillStyle = 'rgba(28,24,18,.86)'; ctx.fillRect(0,0,W,H);
+    if(S.phase==='start'){
+      text('赵 云 与 阿 斗', W/2, 210, 42, '#f8e6b0', 'center');
+      text('汉字塔防 · 复刻 Demo', W/2, 248, 15, '#b0a68c', 'center');
+      const tips = [
+        '· 点击[征召士兵]消耗馒头，随机获得文字',
+        '· 把[刀/枪/骑/弓]拖到空格布防，自动迎击曹军',
+        '· 刀、枪、骑宜放外圈，弓宜放内圈',
+        '· 两个同名同级文字合并升级（最高三级）',
+        '· 集齐武将姓名（如 赵+云）激活金色武将',
+        '· 武将定时释放水墨技能，杀敌八人可升级',
+        '· 歼灭曹军会将其转投敌方战阵',
+        '· 曹军碰到阿斗失一心，三心尽失则败',
+      ];
+      tips.forEach((t,i)=>text(t, 62, 320+i*32, 14, '#e8e0d0'));
+      text('— 点击开始 —', W/2, 640, 18, '#e8c898', 'center');
+    }else{
+      text(S.win?'护 主 有 功':'阿 斗 被 掳', W/2, 320, 44, S.win?'#e8c898':'#e53b3b', 'center');
+      text(S.win?'敌阵已破，阿斗无恙':'曹军掳走了阿斗…', W/2, 365, 15, '#e8e0d0', 'center');
+      text('用时 '+mm+':'+ss, W/2, 395, 13, '#b0a68c', 'center');
+      text('— 点击再战 —', W/2, 470, 18, '#e8c898', 'center');
+    }
+  }
+}
+
+/* ---------------- 输入 ---------------- */
+function toGame(e){
+  const r = cv.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height };
+}
+cv.addEventListener('mousedown', e=>{
+  const m = toGame(e); S.mouse = m;
+  if(S.phase==='start'){ S.phase='play'; beep(440,0.08); return; }
+  if(S.phase==='over'){ reset(); S.phase='play'; return; }
+  if(m.x>=BTN.x && m.x<=BTN.x+BTN.w && m.y>=BTN.y && m.y<=BTN.y+BTN.h){ recruit(); return; }
+  const c = cellAt(m.x, m.y);
+  if(c && c.content) S.drag = { from:c, content:c.content };
+});
+cv.addEventListener('mousemove', e=>{ S.mouse = toGame(e); });
+window.addEventListener('mouseup', e=>{
+  if(!S.drag) return;
+  resolveDrop(S.drag.from, cellAt(toGame(e).x, toGame(e).y));
+  S.drag = null;
+});
+window.addEventListener('keydown', e=>{
+  if(e.key==='m'||e.key==='M') muted = !muted;
+  if((e.key==='r'||e.key==='R') && S.phase==='over'){ reset(); S.phase='play'; }
+});
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now-last)/1000); last = now;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
