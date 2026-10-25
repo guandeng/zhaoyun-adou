@@ -52,10 +52,16 @@ const LV_COLOR = [null,'#2a2620','#2a5aa8','#c03a2a'];
 
 /* ---------------- 音效 ---------------- */
 let AC = null, muted = false;
+const BGM_VOL = 0.28;
+function ensureAC(){
+  AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+  if(AC.state === 'suspended') AC.resume();
+  return AC;
+}
 function beep(f, d, type='square', v=0.04){
   if(muted) return;
   try{
-    AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+    ensureAC();
     const o = AC.createOscillator(), g = AC.createGain();
     o.type = type; o.frequency.value = f;
     g.gain.setValueAtTime(v, AC.currentTime);
@@ -63,6 +69,84 @@ function beep(f, d, type='square', v=0.04){
     o.connect(g); g.connect(AC.destination);
     o.start(); o.stop(AC.currentTime + d);
   }catch(e){}
+}
+
+/* ---------------- 背景音乐：A 羽五声音阶古风循环（程序化合成，无音频文件） ---------------- */
+const PENTA = [220.00, 261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.26];
+const BGM_STEP = 0.25;                    // 每个十六分音符 0.25s → 32 步 ≈ 8 秒一循环
+const BGM_MEL = [
+  5, null, 4, 3,  4, null, 1, null,
+  2, null, 3, 4,  5, null, 4, null,
+  5, null, 6, 5,  4, null, 3, 4,
+  4, null, 2, 1,  0, null, null, null,
+];
+const BGM_BASS = [0, 0, 1, 1];            // 每 8 步一个低音：A / C
+let bgOn = false, bgStep = 0, bgNext = 0, bgTimer = null;
+function bgNote(freq, t, dur, type, vol){
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(AC.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+function bgKick(t, vol){
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(110, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+  o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + 0.16);
+}
+function bgClick(t, vol){
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = 'square'; o.frequency.value = 1500;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.035);
+  o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + 0.05);
+}
+function bgPlayStep(i, t){
+  // 主旋律：拨弦感（起音快、衰减长）
+  const m = BGM_MEL[i];
+  if(m !== null) bgNote(PENTA[m], t, i % 4 === 0 ? 0.7 : 0.42, 'triangle', i % 4 === 0 ? 0.24 : 0.15);
+  // 低音铺底
+  if(i % 8 === 0){
+    const b = BGM_BASS[(i / 8) % BGM_BASS.length];
+    bgNote(PENTA[b] / 2, t, 1.0, 'sine', 0.20);
+  }
+  // 鼓点
+  if(i === 0 || i === 24) bgKick(t, 0.42);
+  if(i === 16) bgKick(t, 0.28);
+  if(i % 8 === 4) bgClick(t, 0.05);
+}
+function bgTick(){
+  if(!bgOn || !AC) return;
+  // 前瞻调度：提前 0.6s 排好音，避免 setTimeout 抖动造成卡拍
+  if(bgNext < AC.currentTime) bgNext = AC.currentTime + 0.05;
+  while(bgNext < AC.currentTime + 0.6){
+    bgPlayStep(bgStep % 32, bgNext);
+    bgNext += BGM_STEP; bgStep++;
+  }
+  bgTimer = setTimeout(bgTick, 120);
+}
+function bgStart(){
+  if(bgOn || muted) return;
+  try{
+    ensureAC();
+    bgOn = true; bgStep = 0; bgNext = AC.currentTime + 0.1;
+    bgTick();
+  }catch(e){ bgOn = false; }
+}
+function bgStop(){
+  bgOn = false;
+  if(bgTimer){ clearTimeout(bgTimer); bgTimer = null; }
+}
+function setMuted(v){
+  muted = v;
+  if(muted) bgStop();
+  else if(S.phase === 'play') bgStart();
 }
 
 /* ---------------- 格子 / 状态 ---------------- */
@@ -342,6 +426,7 @@ function update(dt){
   if(S.e.aiT<=0){ S.e.aiT = CFG.aiTick; aiTick(); }
   if(S.p.core<=0 || S.e.core<=0){
     S.phase='over'; S.win = S.e.core<=0;
+    bgStop();
     if(S.win){ beep(523,.12); setTimeout(()=>beep(659,.12),120); setTimeout(()=>beep(784,.2),240); }
     else beep(140,.5,'sawtooth',0.08);
   }
@@ -636,6 +721,8 @@ function render(){
   const mm = String(Math.floor(S.t/60)).padStart(2,'0'),
         ss = String(Math.floor(S.t%60)).padStart(2,'0');
   text(mm+':'+ss, 464, 424, 13, '#8a7a5a', 'right');
+  // 音乐状态指示
+  text(muted ? '♪̸' : '♪', 424, 424, 14, muted ? '#b0a68c' : '#8a5a10', 'center');
   text('兵营', 28, 716, 11, '#8a7a5a');
   // 红色征召按钮
   const can = S.p.bun>=S.p.cost && freeCell(S.bench).length && S.phase==='play';
@@ -673,6 +760,7 @@ function render(){
       ];
       tips.forEach((t,i)=>text(t, 62, 320+i*32, 14, '#e8e0d0'));
       text('— 点击开始 —', W/2, 640, 18, '#e8c898', 'center');
+      text('M 键静音 / 恢复音乐', W/2, 672, 12, '#8a7a5a', 'center');
     }else{
       text(S.win?'护 主 有 功':'阿 斗 被 掳', W/2, 320, 44, S.win?'#e8c898':'#e53b3b', 'center');
       text(S.win?'敌阵已破，阿斗无恙':'曹军掳走了阿斗…', W/2, 365, 15, '#e8e0d0', 'center');
@@ -689,8 +777,8 @@ function toGame(e){
 }
 cv.addEventListener('mousedown', e=>{
   const m = toGame(e); S.mouse = m;
-  if(S.phase==='start'){ S.phase='play'; beep(440,0.08); return; }
-  if(S.phase==='over'){ reset(); S.phase='play'; return; }
+  if(S.phase==='start'){ S.phase='play'; bgStart(); beep(440,0.08); return; }
+  if(S.phase==='over'){ reset(); S.phase='play'; bgStart(); return; }
   if(m.x>=BTN.x && m.x<=BTN.x+BTN.w && m.y>=BTN.y && m.y<=BTN.y+BTN.h){ recruit(); return; }
   const c = cellAt(m.x, m.y);
   if(c && c.content) S.drag = { from:c, content:c.content };
@@ -702,8 +790,8 @@ window.addEventListener('mouseup', e=>{
   S.drag = null;
 });
 window.addEventListener('keydown', e=>{
-  if(e.key==='m'||e.key==='M') muted = !muted;
-  if((e.key==='r'||e.key==='R') && S.phase==='over'){ reset(); S.phase='play'; }
+  if(e.key==='m'||e.key==='M') setMuted(!muted);
+  if((e.key==='r'||e.key==='R') && S.phase==='over'){ reset(); S.phase='play'; bgStart(); }
 });
 
 /* ---------------- 主循环 ---------------- */
