@@ -44,7 +44,7 @@ const HERO_PAIRS = [['赵','云','赵云'],['关','羽','关羽'],['张','飞','
 const FRAGS = ['赵','云','关','羽','张','飞','黄','忠'];
 const CFG = {
   startBun:20, regen:2.5, baseCost:10, costStep:2, killReward:2,
-  fragChance:0.16, coreHP:3, mobSpeed:32, spawnGap:3.2,
+  fragChance:0.16, pCoreHP:100, eCoreHP:3, mobSpeed:32, spawnGap:3.2,
   mobHp:t=>30+t*1.1, aiTick:1.3, heroKillUp:8, maxLvl:3,
   bossAt:75, bossGap:22, bossHpMul:4.5,
 };
@@ -162,7 +162,8 @@ function benchCells(){                 // 兵营 5 格（原作设定）
   return [48,94,140,186,232].map(x=>({ side:'p', kind:'bench', x:x-20, y:724, size:40, cx:x, cy:744, content:null }));
 }
 function newSide(side){
-  return { side, bun:CFG.startBun, cost:CFG.baseCost, core:CFG.coreHP,
+  const hp = side === 'p' ? CFG.pCoreHP : CFG.eCoreHP;
+  return { side, bun:CFG.startBun, cost:CFG.baseCost, core:hp, maxCore:hp,
            cells:gridCells(side), mobs:[], spawnT:1.5, aiT:2, bossT:CFG.bossAt, flash:0 };
 }
 let S;
@@ -170,7 +171,7 @@ function reset(){
   S = { phase:'start', t:0, p:newSide('p'), e:newSide('e'),
         bench:benchCells(), inks:[], floats:[],
         fx:[], banner:null, shake:0,
-        drag:null, mouse:{x:0,y:0}, win:false };
+        drag:null, shovel:false, mouse:{x:0,y:0}, win:false };
 }
 reset();
 
@@ -201,13 +202,24 @@ function inkBurst(x, y, n, spread){
 const easeOut = p => 1 - Math.pow(1-p, 3);
 
 /* ---------------- 玩家操作 ---------------- */
-const BTN = { x:272, y:724, w:192, h:60 };
+const BTN = { x:272, y:724, w:140, h:56 };
+const SHOVEL = { x:420, y:728, w:44, h:48 };
 function recruit(){
   const p = S.p, free = freeCell(S.bench);
   if(p.bun < p.cost || !free.length) return;
   p.bun -= p.cost; p.cost += CFG.costStep;
   free[0].content = rollPiece();
   beep(500,0.06,'square',0.05);
+}
+function shovelAt(c){
+  if(!c || !c.content) return false;
+  const u = c.content;
+  const name = u.troop || u.hero || u.frag;
+  c.content = null;
+  inkBurst(c.cx, c.cy, 10, 150);
+  S.floats.push({ x:c.cx, y:c.cy-28, text:'铲除 ' + name, t:0, color:'#6a5a3a' });
+  beep(220,0.09,'triangle',0.05);
+  return true;
 }
 function cellAt(x,y){
   return allCells('p').find(c=>x>=c.x && x<c.x+c.size && y>=c.y && y<c.y+c.size);
@@ -527,7 +539,22 @@ function drawAdou(coreY, heartY, side, label){
     ctx.fillRect(0, side.side==='p'?DIV:0, W, DIV); }
   block(x, y, s, '#cfe0f4', '#2a4a8a');
   text('斗', LANE_X, coreY+s*0.3, s*0.66, '#2a4a8a', 'center');
-  for(let i=0;i<CFG.coreHP;i++) heart(LANE_X-30+i*22, heartY, 3, i<side.core);
+  // 血量显示：少量命用红心，100 命改数值血条
+  const maxC = side.maxCore || CFG.eCoreHP;
+  if(maxC <= 6){
+    for(let i=0;i<maxC;i++) heart(LANE_X-30+i*22, heartY, 3, i<side.core);
+  } else {
+    const bw = 128, bh = 9, bx = LANE_X-bw/2, by = heartY - 8;
+    ctx.fillStyle = 'rgba(0,0,0,.10)';
+    ctx.fillRect(bx, by, bw, bh+3);
+    ctx.fillStyle = '#d8c9b0'; ctx.fillRect(bx, by, bw, bh);
+    const r = Math.max(0, side.core/maxC);
+    ctx.fillStyle = r > 0.5 ? '#3b7f4a' : r > 0.25 ? '#c98a2a' : '#c03a2a';
+    ctx.fillRect(bx, by, bw*r, bh);
+    ctx.strokeStyle = '#8a7a5a'; ctx.lineWidth = 1;
+    ctx.strokeRect(bx+0.5, by+0.5, bw-1, bh-1);
+    text('命 ' + side.core + ' / ' + maxC, LANE_X, by+bh+17, 15, '#2a4a8a', 'center');
+  }
   text(label, LANE_X, side.side==='p' ? coreY+s/2+18 : coreY+s/2+16, 11, '#8a7a5a', 'center');
 }
 function drawMob(m){
@@ -730,8 +757,29 @@ function render(){
   ctx.fillRect(BTN.x, BTN.y, BTN.w, BTN.h);
   ctx.strokeStyle = can ? '#e8c898' : '#c8bfae'; ctx.lineWidth = 2;
   ctx.strokeRect(BTN.x+2, BTN.y+2, BTN.w-4, BTN.h-4);
-  text('征 召 士 兵', BTN.x+BTN.w/2, BTN.y+26, 17, can?'#f8ecd0':'#e0d8c8', 'center');
-  text('馒头 × '+S.p.cost, BTN.x+BTN.w/2, BTN.y+47, 13, can?'#f0d0a0':'#d0c8b8', 'center');
+  text('征 召 士 兵', BTN.x+BTN.w/2, BTN.y+24, 16, can?'#f8ecd0':'#e0d8c8', 'center');
+  text('馒头 × '+S.p.cost, BTN.x+BTN.w/2, BTN.y+44, 12, can?'#f0d0a0':'#d0c8b8', 'center');
+  // 铲子按钮
+  const on = S.shovel;
+  ctx.fillStyle = on ? '#6a5a3a' : '#8a7a5a';
+  ctx.fillRect(SHOVEL.x, SHOVEL.y, SHOVEL.w, SHOVEL.h);
+  ctx.strokeStyle = on ? '#f8e6b0' : '#c8bfae'; ctx.lineWidth = on ? 3 : 2;
+  ctx.strokeRect(SHOVEL.x+2, SHOVEL.y+2, SHOVEL.w-4, SHOVEL.h-4);
+  // 铲子图形：木柄 + 铲头
+  const cx0 = SHOVEL.x + SHOVEL.w/2, ty0 = SHOVEL.y + 10;
+  ctx.strokeStyle = '#f0e4c8'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx0, ty0); ctx.lineTo(cx0, ty0+16); ctx.stroke();
+  ctx.fillStyle = '#f0e4c8';
+  ctx.beginPath();
+  ctx.moveTo(cx0-8, ty0+16); ctx.lineTo(cx0+8, ty0+16);
+  ctx.lineTo(cx0+5, ty0+28); ctx.lineTo(cx0-5, ty0+28);
+  ctx.closePath(); ctx.fill();
+  text('铲', cx0, SHOVEL.y+SHOVEL.h-3, 9, on?'#f8e6b0':'#d8ccb4', 'center');
+  if(on){
+    ctx.fillStyle = 'rgba(106,90,58,.10)';
+    ctx.fillRect(LANE_X-118, DIV-14, 236, 26);
+    text('点击要铲除的棋子（不返还馒头）', LANE_X, DIV+3, 12, '#6a5a3a', 'center');
+  }
   // 拖拽幽灵 + 射程圈
   if(S.drag){
     const d = S.drag, m = S.mouse;
@@ -756,9 +804,10 @@ function render(){
         '· 集齐武将姓名（如 赵+云）激活金色武将',
         '· 武将定时释放水墨技能，杀敌八人可升级',
         '· 歼灭曹军会将其转投敌方战阵',
-        '· 曹军碰到阿斗失一心，三心尽失则败',
+        '· 棋子占错格：点[铲子]再点该棋子即可铲除',
+        '· 敌方阿斗只有三条命，破敌即胜',
       ];
-      tips.forEach((t,i)=>text(t, 62, 320+i*32, 14, '#e8e0d0'));
+      tips.forEach((t,i)=>text(t, 62, 312+i*30, 13, '#e8e0d0'));
       text('— 点击开始 —', W/2, 640, 18, '#e8c898', 'center');
       text('M 键静音 / 恢复音乐', W/2, 672, 12, '#8a7a5a', 'center');
     }else{
@@ -779,8 +828,19 @@ cv.addEventListener('mousedown', e=>{
   const m = toGame(e); S.mouse = m;
   if(S.phase==='start'){ S.phase='play'; bgStart(); beep(440,0.08); return; }
   if(S.phase==='over'){ reset(); S.phase='play'; bgStart(); return; }
-  if(m.x>=BTN.x && m.x<=BTN.x+BTN.w && m.y>=BTN.y && m.y<=BTN.y+BTN.h){ recruit(); return; }
+  if(m.x>=BTN.x && m.x<=BTN.x+BTN.w && m.y>=BTN.y && m.y<=BTN.y+BTN.h){
+    S.shovel = false; recruit(); return;
+  }
+  if(m.x>=SHOVEL.x && m.x<=SHOVEL.x+SHOVEL.w && m.y>=SHOVEL.y && m.y<=SHOVEL.y+SHOVEL.h){
+    S.shovel = !S.shovel; S.drag = null;
+    beep(S.shovel ? 320 : 260, 0.06, 'triangle', 0.05);
+    return;
+  }
   const c = cellAt(m.x, m.y);
+  if(S.shovel){
+    if(shovelAt(c)) S.shovel = false;   // 铲一次后自动退出铲子模式
+    return;
+  }
   if(c && c.content) S.drag = { from:c, content:c.content };
 });
 cv.addEventListener('mousemove', e=>{ S.mouse = toGame(e); });
@@ -792,6 +852,7 @@ window.addEventListener('mouseup', e=>{
 window.addEventListener('keydown', e=>{
   if(e.key==='m'||e.key==='M') setMuted(!muted);
   if((e.key==='r'||e.key==='R') && S.phase==='over'){ reset(); S.phase='play'; bgStart(); }
+  if(e.key==='Escape'){ S.shovel = false; S.drag = null; }
 });
 
 /* ---------------- 主循环 ---------------- */
